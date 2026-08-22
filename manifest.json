@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "id": "apurvanpradhan.lookout",
+  "name": "Lookout",
+  "version": "1.0.0",
+  "author": "Apurva N Pradhan",
+  "license": "MIT",
+  "description": "Monitor local development servers in the Omarchy bar, with quick links to the browser, terminal, editor, files, restart, and kill actions.",
+  "kinds": ["service", "bar-widget"],
+  "entryPoints": {
+    "service": "Service.qml",
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Lookout",
+    "description": "Dev-server watcher: count in the bar, server list with actions in a popup.",
+    "category": "Development",
+    "aliases": ["dev", "servers", "dev-servers"],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 5,
+      "notifyOnChange": "On"
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Poll interval (seconds)",
+        "min": 2,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "notifyOnChange",
+        "type": "enum",
+        "label": "Notify on server start/stop",
+        "options": ["On", "Off"],
+        "defaultValue": "On"
+      }
+    ]
+  }
+}
