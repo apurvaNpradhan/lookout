@@ -2,7 +2,7 @@
 
 Lookout monitors local development servers and puts them in the Omarchy bar. Open a server in your browser, terminal, editor, or file manager; restart or stop it; rename it; and configure a URL path for browser links.
 
-![Lookout showing detected development servers](assets/lookout-demo.png)
+![Lookout showing detected development servers](preview.png)
 
 ## Features
 
