@@ -70,9 +70,12 @@ Panel {
   function armKillAll() { killAllArmed = true; rearmTimer.restart() }
   function confirmedKillAll() {
     killAllArmed = false
-    var pids = []
-    for (var i in root.servers) pids.push(String(root.servers[i].pid))
-    if (service && pids.length > 0) service.runAction("kill-all", ["--pids"].concat(pids))
+    var targets = []
+    for (var i in root.servers) {
+      targets.push({ pid: root.servers[i].pid, identity: root.servers[i].identity })
+    }
+    if (service && targets.length > 0)
+      service.runAction("kill-all", ["--targets", JSON.stringify(targets)])
   }
   Timer { id: rearmTimer; interval: 3000; onTriggered: root.killAllArmed = false }
 
@@ -175,6 +178,7 @@ Panel {
 
             Text {
               id: countText
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               text: root.servers.length + " server(s)"
@@ -200,6 +204,7 @@ Panel {
           Text {
             visible: root.servers.length === 0
             width: column.width
+            textFormat: Text.PlainText
             text: "No dev servers running"
             color: root.dim
             font.family: root.fontFamily
@@ -257,6 +262,7 @@ Panel {
         Text {
           Layout.fillWidth: true
           Layout.alignment: Qt.AlignVCenter
+          textFormat: Text.PlainText
           text: root.displayName(row.server)
             + (row.server.appName ? " [" + row.server.appName + "]" : "")
             + "  :" + row.server.port
@@ -271,6 +277,7 @@ Panel {
 
         Text {
           Layout.alignment: Qt.AlignVCenter
+          textFormat: Text.PlainText
           text: root.formatUptime(row.server.uptimeSec)
           color: root.dim
           font.family: root.fontFamily
@@ -282,6 +289,7 @@ Panel {
       Text {
         visible: text !== ""
         width: inner.width
+        textFormat: Text.PlainText
         text: [row.server.projectPath,
                (row.server.cpu != null ? "CPU " + Number(row.server.cpu).toFixed(1) + "%" : ""),
                (row.server.memMB ? row.server.memMB + " MB" : "")]
@@ -319,7 +327,8 @@ Panel {
           enabled: !!(row.server.projectPath && row.server.argv && row.server.argv.length > 0)
           opacity: enabled ? 1 : 0.45
           onClicked: root.service.runAction("restart",
-            [String(row.server.pid), row.server.projectPath, JSON.stringify(row.server.argv)])
+            [String(row.server.pid), String(row.server.identity),
+             row.server.projectPath, JSON.stringify(row.server.argv)])
         }
       }
 
@@ -338,7 +347,10 @@ Panel {
         ActionButton {
           text: "Kill"
           foreground: root.danger
-          onClicked: root.service.runAction("kill", [String(row.server.pid)])
+          enabled: !!row.server.identity
+          opacity: enabled ? 1 : 0.45
+          onClicked: root.service.runAction("kill",
+            [String(row.server.pid), String(row.server.identity)])
         }
       }
 

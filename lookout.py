@@ -11,11 +11,13 @@ import fcntl
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -35,6 +37,24 @@ PREFS_PATH = os.path.join(STATE_DIR, "prefs.json")
 LOCK_PATH = os.path.join(STATE_DIR, ".prefs.lock")
 DEVNULL = subprocess.DEVNULL
 HTTPS_CTX = ssl._create_unverified_context()
+MAX_PREFS_BYTES = 256 * 1024
+MAX_SS_OUTPUT_BYTES = 512 * 1024
+MAX_PS_OUTPUT_BYTES = 512 * 1024
+MAX_SCAN_OUTPUT_BYTES = 512 * 1024
+MAX_LISTENERS = 512
+MAX_OWNERS_PER_LINE = 32
+MAX_ARGV_BYTES = 64 * 1024
+MAX_ARGC = 128
+MAX_TEXT_BYTES = 16 * 1024
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+HTTP_OPENER = urllib.request.build_opener(
+    NoRedirectHandler(), urllib.request.HTTPSHandler(context=HTTPS_CTX))
 
 # Tier-2 classification only applies to these well-known dev ports.
 DEV_PORTS = {3000, 3001, 3002, 3003, 3004, 3005, 4000, 4200, 4321, 5000,
@@ -140,6 +160,8 @@ def run_detached(command):
 def _load_prefs():
     default = {"labels": {}, "paths": {}, "lastPorts": None, "lastHealth": {}}
     try:
+        if os.path.getsize(PREFS_PATH) > MAX_PREFS_BYTES:
+            return default
         with open(PREFS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
@@ -162,18 +184,39 @@ def locked_prefs():
     Persists only when a value actually changed, so a steady-state scan
     never touches the file.
     """
-    os.makedirs(STATE_DIR, exist_ok=True)
-    fd = os.open(LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(LOCK_PATH, flags, 0o600)
+    os.fchmod(fd, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         prefs = _load_prefs()
         before = json.dumps(prefs, sort_keys=True)
         yield prefs
         if json.dumps(prefs, sort_keys=True) != before:
-            tmp = os.path.join(STATE_DIR, ".prefs.tmp")
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(prefs, f, indent=2)
-            os.replace(tmp, PREFS_PATH)
+            tmp = None
+            tmp_fd = None
+            try:
+                tmp_fd, tmp = tempfile.mkstemp(prefix=".prefs.", suffix=".tmp",
+                                               dir=STATE_DIR)
+                os.fchmod(tmp_fd, 0o600)
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    tmp_fd = None
+                    json.dump(prefs, f, indent=2)
+                os.replace(tmp, PREFS_PATH)
+                tmp = None
+            finally:
+                if tmp_fd is not None:
+                    os.close(tmp_fd)
+                if tmp:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
     finally:
         try:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -183,6 +226,42 @@ def locked_prefs():
 
 
 # ------------------------------------------------------------- detection
+
+def run_bounded(command, max_bytes, timeout):
+    """Run a command while bounding stdout and wall-clock time."""
+    proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=DEVNULL)
+    start = time.monotonic()
+    chunks = []
+    total = 0
+    try:
+        while True:
+            remaining = timeout - (time.monotonic() - start)
+            if remaining <= 0:
+                raise TimeoutError("command timed out")
+            ready, _, _ = select.select([proc.stdout], [], [], remaining)
+            if not ready:
+                raise TimeoutError("command timed out")
+            chunk = os.read(proc.stdout.fileno(), min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("command output exceeded limit")
+            chunks.append(chunk)
+        remaining = max(0, timeout - (time.monotonic() - start))
+        returncode = proc.wait(timeout=remaining)
+        if returncode != 0:
+            raise RuntimeError("command exited %d" % returncode)
+        return b"".join(chunks).decode("utf-8", "replace")
+    except Exception:
+        if proc.poll() is None:
+            proc.kill()
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+        raise
+
 
 def parse_ss_line(line):
     """One `ss -tlnp` line -> [(pid, port, name), ...]; empty on non-listener lines.
@@ -198,8 +277,10 @@ def parse_ss_line(line):
     if not m:
         return []
     entries = []
-    for pm in re.finditer(r'"([^"]*)"\s*,\s*pid=(\d+)', m.group(1)):
-        entries.append((int(pm.group(2)), int(port), pm.group(1)))
+    for index, pm in enumerate(re.finditer(r'"([^"]*)"\s*,\s*pid=(\d+)', m.group(1))):
+        if index >= MAX_OWNERS_PER_LINE:
+            raise RuntimeError("ss owner limit exceeded")
+        entries.append((int(pm.group(2)), int(port), pm.group(1)[:MAX_TEXT_BYTES]))
     return entries
 
 
@@ -210,15 +291,14 @@ def scan_listeners():
     discovery must not look like an empty scan (the caller keeps the last
     good snapshot instead)."""
     try:
-        proc = subprocess.run(["ss", "-tlnp"], capture_output=True, text=True,
-                              timeout=10)
+        out = run_bounded(["ss", "-tlnp"], MAX_SS_OUTPUT_BYTES, 10)
     except Exception as e:
         raise RuntimeError("ss failed: %s" % e)
-    if proc.returncode != 0:
-        raise RuntimeError("ss exited %d: %s" % (proc.returncode, (proc.stderr or "").strip()[:120]))
     entries = []
-    for line in (proc.stdout or "").splitlines():
+    for line in out.splitlines():
         entries.extend(parse_ss_line(line))
+        if len(entries) > MAX_LISTENERS:
+            raise RuntimeError("listener limit exceeded")
     # dedupe (pid, port)
     seen, uniq = set(), []
     for e in entries:
@@ -234,10 +314,10 @@ def query_ps(pids):
     if not pids:
         return {}
     try:
-        out = subprocess.run(
-            ["ps", "-p", ",".join(str(p) for p in pids),
+        out = run_bounded(
+            ["ps", "-p", ",".join(str(p) for p in pids[:MAX_LISTENERS]),
              "-o", "pid=,pcpu=,rss=,etimes=,args="],
-            capture_output=True, text=True, timeout=10).stdout or ""
+            MAX_PS_OUTPUT_BYTES, 10)
     except Exception:
         return {}
     info = {}
@@ -249,7 +329,7 @@ def query_ps(pids):
             "cpu": float(m.group(2)),
             "memKB": int(m.group(3)),
             "uptime": int(m.group(4)),
-            "command": m.group(5),
+            "command": m.group(5)[:MAX_TEXT_BYTES],
         }
     return info
 
@@ -286,13 +366,39 @@ def infer_app_name(project_path, command, home):
 
 
 def read_argv(pid):
-    """Exact argv for /proc/<pid>/cmdline (NUL-separated), or None."""
+    """Exact, bounded argv for /proc/<pid>/cmdline, or None."""
     try:
         with open("/proc/%d/cmdline" % pid, "rb") as f:
-            parts = f.read().split(b"\0")
-        return [p.decode("utf-8", "replace") for p in parts if p] or None
+            raw = f.read(MAX_ARGV_BYTES + 1)
+        if len(raw) > MAX_ARGV_BYTES:
+            return None
+        parts = [p for p in raw.split(b"\0") if p]
+        if not parts or len(parts) > MAX_ARGC:
+            return None
+        argv = [p.decode("utf-8", "replace") for p in parts]
+        if any(len(p.encode("utf-8")) > MAX_TEXT_BYTES for p in argv):
+            return None
+        return argv
     except Exception:
         return None
+
+
+def process_identity(pid):
+    """Linux process start time, stable across exec and changed on PID reuse."""
+    try:
+        with open("/proc/%d/stat" % pid, "r", encoding="utf-8") as f:
+            stat = f.read(4096)
+        end_comm = stat.rfind(")")
+        if end_comm < 0:
+            return None
+        fields = stat[end_comm + 2:].split()
+        return fields[19] if len(fields) > 19 else None
+    except Exception:
+        return None
+
+
+def target_matches(pid, identity):
+    return bool(identity) and process_identity(pid) == str(identity)
 
 
 def parse_pid(s):
@@ -305,18 +411,16 @@ def parse_pid(s):
 
 
 def probe(port):
-    """(health, https). https first: any connection -> green+https. Then http:
-    connection with status < 500 -> green, >= 500 -> yellow; refusal/timeout -> unknown."""
+    """Probe localhost without following redirects to another host."""
     try:
-        urllib.request.urlopen("https://localhost:%d" % port,
-                               timeout=1.5, context=HTTPS_CTX)
+        HTTP_OPENER.open("https://localhost:%d" % port, timeout=1.5)
         return ("green", True)
     except urllib.error.HTTPError:
         return ("green", True)
     except Exception:
         pass
     try:
-        urllib.request.urlopen("http://localhost:%d" % port, timeout=1.5)
+        HTTP_OPENER.open("http://localhost:%d" % port, timeout=1.5)
         return ("green", False)
     except urllib.error.HTTPError as e:
         return (("yellow" if e.code >= 500 else "green"), False)
@@ -400,11 +504,12 @@ def cmd_scan(notify_on):
                 continue
             project_path = None
             try:
-                project_path = os.readlink("/proc/%d/cwd" % pid)
+                project_path = os.readlink("/proc/%d/cwd" % pid)[:MAX_TEXT_BYTES]
             except Exception:
                 project_path = None
             servers.append({
                 "pid": pid,
+                "identity": process_identity(pid),
                 "port": port,
                 "label": label,
                 "appName": infer_app_name(project_path, raw_cmd or "", home),
@@ -431,7 +536,10 @@ def cmd_scan(notify_on):
                 prefs.get("lastPorts"), current, labels,
                 {s["port"]: s for s in servers}, notify_on)
 
-        print(json.dumps({"ok": True, "servers": servers, "labels": labels, "paths": paths}))
+        payload = json.dumps({"ok": True, "servers": servers, "labels": labels, "paths": paths})
+        if len(payload.encode("utf-8")) > MAX_SCAN_OUTPUT_BYTES:
+            raise RuntimeError("scan payload exceeded limit")
+        print(payload)
     except Exception:
         traceback.print_exc(file=sys.stderr)
         # Discovery failure must not look like an empty scan: the service
@@ -489,10 +597,11 @@ def cmd_edit(path):
 
 
 def cmd_kill(args):
-    # SIGTERM only, and return immediately: an escalation thread would delay
-    # the follow-up refresh by seconds and could SIGKILL a recycled PID.
-    pid = parse_pid(args[0]) if args else None
-    if not pid:
+    # <pid> <identity>; refuse a recycled PID instead of signalling it.
+    if len(args) < 2 or len(args[1]) > 64:
+        return 2
+    pid = parse_pid(args[0])
+    if not pid or not target_matches(pid, args[1]):
         return 2
     try:
         os.kill(pid, signal.SIGTERM)
@@ -502,15 +611,22 @@ def cmd_kill(args):
 
 
 def cmd_kill_all(args):
-    pids = []
-    for a in args:
-        if a == "--pids":
-            continue
-        pid = parse_pid(a)
-        if not pid:
+    # --targets <json>, where each item is {pid, identity} from one scan.
+    if (len(args) != 2 or args[0] != "--targets"
+            or len(args[1].encode("utf-8")) > MAX_SCAN_OUTPUT_BYTES):
+        return 2
+    try:
+        targets = json.loads(args[1])
+    except ValueError:
+        return 2
+    if not isinstance(targets, list) or len(targets) > MAX_LISTENERS:
+        return 2
+    for target in targets:
+        if not isinstance(target, dict):
             return 2
-        pids.append(pid)
-    for pid in pids:
+        pid = parse_pid(target.get("pid"))
+        if not pid or not target_matches(pid, target.get("identity")):
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except OSError:
@@ -519,16 +635,17 @@ def cmd_kill_all(args):
 
 
 def cmd_restart(args):
-    # <pid> <cwd> <argv-json> — argv is the exact NUL-read command vector,
-    # relayed as JSON so argument boundaries survive without a shell.
-    if len(args) < 3:
+    # <pid> <identity> <cwd> <argv-json>; no shell is involved.
+    if len(args) < 4:
         return 2
     pid = parse_pid(args[0])
-    if not pid:
+    if (not pid or len(args[1]) > 64 or not target_matches(pid, args[1])
+            or len(args[2].encode("utf-8")) > MAX_TEXT_BYTES
+            or len(args[3].encode("utf-8")) > MAX_ARGV_BYTES):
         return 2
-    cwd = args[1] or None
+    cwd = args[2] or None
     try:
-        argv = json.loads(args[2])
+        argv = json.loads(args[3])
     except ValueError:
         return 2
     if (not isinstance(argv, list) or not argv
@@ -555,6 +672,8 @@ def edit_pref_value(kind, args):
     if len(args) < 2:
         return 2
     port, value = args[0], args[1]
+    if len(value.encode("utf-8")) > MAX_TEXT_BYTES:
+        return 2
     key = "port_%s" % port
     with locked_prefs() as prefs:
         bucket = prefs.setdefault(kind, {})
@@ -623,6 +742,13 @@ def _selftest2():
     # Restart argv round-trips through JSON as a list of strings.
     argv = ["node", "server.js", "--port", "3000"]
     assert json.loads(json.dumps(argv)) == argv
+    # A live process matches its start-time identity; a stale one does not.
+    identity = process_identity(os.getpid())
+    assert identity and target_matches(os.getpid(), identity)
+    assert not target_matches(os.getpid(), "stale")
+    # The old, identity-less kill-all protocol is rejected.
+    assert cmd_kill_all(["--pids", str(os.getpid())]) == 2
+    assert run_bounded([sys.executable, "-c", "print('ok')"], 1024, 2).strip() == "ok"
     print("lookout selftest2: ok")
 
 
