@@ -15,7 +15,7 @@
     "displayName": "Lookout",
     "description": "Dev-server watcher: count in the bar, server list with actions in a popup.",
     "category": "Development",
-    "aliases": ["dev", "servers", "dev-servers"],
+    "aliases": ["lookout", "dev", "servers", "dev-servers"],
     "allowMultiple": false,
     "defaultSection": "right",
     "defaults": {

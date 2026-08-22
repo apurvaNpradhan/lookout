@@ -57,7 +57,7 @@ Lookout stores its preferences in `$XDG_STATE_HOME/omarchy/lookout`, or `~/.loca
 rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/lookout"
 ```
 
-Lookout only sends signals to PIDs selected from its detected server list. It does not modify project files or overwrite Omarchy configuration without an explicit action.
+The panel only offers signals for PIDs currently detected as development servers. Lookout does not modify project files or overwrite Omarchy configuration without an explicit action.
 
 ## License
 
