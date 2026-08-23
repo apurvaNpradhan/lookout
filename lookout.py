@@ -7,6 +7,7 @@ CLI: python3 <plugindir>/lookout.py <command> [args...]
 Commands: scan, open, fm, term, edit, kill, kill-all, restart, label, path
 `scan` is the only stdout writer; everything else is silent.
 """
+import errno
 import fcntl
 import json
 import os
@@ -384,7 +385,12 @@ def read_argv(pid):
 
 
 def process_identity(pid):
-    """Linux process start time, stable across exec and changed on PID reuse."""
+    """PID identity: process start time plus the executable's inode.
+
+    The start time changes on PID reuse; the exe inode changes when the
+    process execs a different binary (start time alone survives exec, so a
+    stored target could become another executable without invalidating it).
+    """
     try:
         with open("/proc/%d/stat" % pid, "r", encoding="utf-8") as f:
             stat = f.read(4096)
@@ -392,13 +398,48 @@ def process_identity(pid):
         if end_comm < 0:
             return None
         fields = stat[end_comm + 2:].split()
-        return fields[19] if len(fields) > 19 else None
+        start = fields[19] if len(fields) > 19 else None
+        if start is None:
+            return None
+        return "%s:%s" % (start, os.stat("/proc/%d/exe" % pid).st_ino)
     except Exception:
         return None
 
 
 def target_matches(pid, identity):
     return bool(identity) and process_identity(pid) == str(identity)
+
+
+def signal_if_matches(pid, identity):
+    """Send SIGTERM iff the identity still matches, with no PID-reuse window.
+
+    pidfd_open pins the task, so its numeric PID cannot be recycled between
+    the identity check and os.kill (os.pidfd_send_signal was removed from
+    Python's os module in 3.14; the pin makes plain kill safe). Returns True
+    when a signal was delivered.
+    """
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError as e:
+        if e.errno == errno.EINVAL:
+            # ponytail: kernels <5.3 lack pidfd_open; the check+kill race remains there
+            if not target_matches(pid, identity):
+                return False
+            try:
+                os.kill(pid, signal.SIGTERM)
+                return True
+            except OSError:
+                return False
+        return False  # ESRCH: already gone
+    try:
+        if not target_matches(pid, identity):
+            return False
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False  # signalled a zombie or lost the race to natural exit
+    finally:
+        os.close(pidfd)
 
 
 def parse_pid(s):
@@ -601,12 +642,8 @@ def cmd_kill(args):
     if len(args) < 2 or len(args[1]) > 64:
         return 2
     pid = parse_pid(args[0])
-    if not pid or not target_matches(pid, args[1]):
+    if not pid or not signal_if_matches(pid, args[1]):
         return 2
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass  # already gone
     return 0
 
 
@@ -625,12 +662,8 @@ def cmd_kill_all(args):
         if not isinstance(target, dict):
             return 2
         pid = parse_pid(target.get("pid"))
-        if not pid or not target_matches(pid, target.get("identity")):
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            pass
+        if pid:
+            signal_if_matches(pid, target.get("identity"))
     return 0
 
 
@@ -639,7 +672,7 @@ def cmd_restart(args):
     if len(args) < 4:
         return 2
     pid = parse_pid(args[0])
-    if (not pid or len(args[1]) > 64 or not target_matches(pid, args[1])
+    if (not pid or len(args[1]) > 64
             or len(args[2].encode("utf-8")) > MAX_TEXT_BYTES
             or len(args[3].encode("utf-8")) > MAX_ARGV_BYTES):
         return 2
@@ -651,10 +684,8 @@ def cmd_restart(args):
     if (not isinstance(argv, list) or not argv
             or not all(isinstance(a, str) and a for a in argv)):
         return 2
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError:
-        pass
+    if not signal_if_matches(pid, args[1]):
+        return 2
 
     def relaunch():
         time.sleep(0.8)  # let the old process release its port
@@ -742,10 +773,45 @@ def _selftest2():
     # Restart argv round-trips through JSON as a list of strings.
     argv = ["node", "server.js", "--port", "3000"]
     assert json.loads(json.dumps(argv)) == argv
-    # A live process matches its start-time identity; a stale one does not.
+    # A live process matches its own identity; a stale one does not.
     identity = process_identity(os.getpid())
     assert identity and target_matches(os.getpid(), identity)
     assert not target_matches(os.getpid(), "stale")
+    # Identity is exec-sensitive: a pid that execs a different binary no
+    # longer matches the identity recorded for the previous executable.
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import os,time; time.sleep(1); os.execv('/usr/bin/sleep', ['sleep', '30'])"])
+    try:
+        pre = process_identity(child.pid)
+        assert pre and pre.split(":", 1)[1] == str(os.stat(sys.executable).st_ino)
+        sleep_ino = str(os.stat("/usr/bin/sleep").st_ino)
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            pid_ident = process_identity(child.pid)
+            if pid_ident and pid_ident.split(":", 1)[1] == sleep_ino:
+                break
+            time.sleep(0.05)
+        assert pid_ident and pid_ident.split(":", 1)[1] == sleep_ino, \
+            "exec must swap the exe inode inside the identity"
+        assert not target_matches(child.pid, pre)  # pre-exec identity is stale now
+    finally:
+        try:
+            os.kill(child.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        child.wait()
+    # signal_if_matches matches+signals a live child, refuses a stale
+    # identity without signalling, and never signals an already-gone pid.
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        child_ident = process_identity(child.pid)
+        assert child_ident and signal_if_matches(child.pid, child_ident) is True
+        assert child.wait(timeout=5) == -signal.SIGTERM
+        assert signal_if_matches(child.pid, child_ident) is False
+        assert not signal_if_matches(os.getpid(), "1:2")
+    finally:
+        if child.poll() is None:
+            child.kill()
     # The old, identity-less kill-all protocol is rejected.
     assert cmd_kill_all(["--pids", str(os.getpid())]) == 2
     assert run_bounded([sys.executable, "-c", "print('ok')"], 1024, 2).strip() == "ok"
